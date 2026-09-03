@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drone</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    height:100%;
+    background:#ffffff;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  body {
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:28px;
+    padding:24px;
+  }
+  #info { font-size:22px; color:#000; text-align:center; }
+  #startBtn {
+    font-size:22px;
+    padding:14px 28px;
+    font-family:inherit;
+    background:#fff;
+    border:2px solid #000;
+    cursor:pointer;
+  }
+  #startBtn:hover { background:#000; color:#fff; }
+  #controls {
+    display:flex;
+    align-items:center;
+    gap:14px;
+    font-size:20px;
+  }
+  #tempo { width:220px; }
+  #stage {
+    position:relative;
+    width:min(80vmin, 600px);
+    height:min(80vmin, 600px);
+    border:2px solid #000;
+    touch-action:none;
+  }
+  .axisLine { position:absolute; background:#ccc; }
+  .axisLineV { left:50%; top:0; bottom:0; width:1px; }
+  .axisLineH { top:50%; left:0; right:0; height:1px; }
+  .axisLabel { position:absolute; font-size:20px; color:#000; }
+  #handle {
+    position:absolute;
+    width:40px;
+    height:40px;
+    border-radius:50%;
+    background:#000;
+    left:50%;
+    top:50%;
+    transform:translate(-50%,-50%);
+    pointer-events:none;
+  }
+  #readout { font-size:20px; color:#000; text-align:center; }
+</style>
+</head>
+<body>
+
+  <div id="info">Drag anywhere in the box. Left/right changes pitch, up/down changes brightness.</div>
+
+  <div id="controls">
+    <button id="startBtn">Start Drone</button>
+    <label for="tempo">RPM</label>
+    <input type="range" id="tempo" min="0" max="100" value="100">
+  </div>
+
+  <div id="stage">
+    <div class="axisLine axisLineV"></div>
+    <div class="axisLine axisLineH"></div>
+    <div class="axisLabel" style="top:8px; left:50%; transform:translateX(-50%);">Y</div>
+    <div class="axisLabel" style="bottom:8px; left:50%; transform:translateX(-50%);">-Y</div>
+    <div class="axisLabel" style="left:8px; top:50%; transform:translateY(-50%);">-X</div>
+    <div class="axisLabel" style="right:8px; top:50%; transform:translateY(-50%);">X</div>
+    <div id="handle"></div>
+  </div>
+
+  <div id="readout">x: 0.00&nbsp;&nbsp;&nbsp;y: 0.00</div>
+
+<script>
+  // ---------- Audio ----------
+  let audioCtx, masterGain, filter, voices = [];
+  let tremoloGain, tremoloLfo, tremoloShaper, tremoloDepthGain;
+  let running = false;
+
+  const ratios = [1, 1.5, 2, 3]; // root, fifth, octave, octave+fifth -> drone chord
+
+  function initAudio() {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.0001;
+
+    filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 1000;
+    filter.Q.value = 1;
+
+    // RPM gate: at 100 this stays fully open, identical to the plain drone.
+    // lowering it introduces a brief, clean pause once per cycle -- on, on,
+    // on, off -- and slows that cycle down the further down you go.
+    tremoloGain = audioCtx.createGain();
+    tremoloGain.gain.value = 1;
+
+    tremoloLfo = audioCtx.createOscillator();
+    tremoloLfo.type = 'sine';
+    tremoloLfo.frequency.value = 8;
+
+    // shape the sine so it stays near "on" for most of the cycle and only
+    // dips to "off" briefly, instead of a smooth 50/50 wobble
+    tremoloShaper = audioCtx.createWaveShaper();
+    const curve = new Float32Array(256);
+    for (let i = 0; i < 256; i++) {
+      const x = (i / 255) * 2 - 1;
+      const unipolar = (x + 1) / 2;
+      const gate = 1 - Math.pow(1 - unipolar, 6); // mostly 1, brief dip to 0
+      curve[i] = gate * 2 - 1;
+    }
+    tremoloShaper.curve = curve;
+
+    tremoloDepthGain = audioCtx.createGain();
+    tremoloDepthGain.gain.value = 0; // no depth = untouched sound at top of slider
+
+    tremoloLfo.connect(tremoloShaper);
+    tremoloShaper.connect(tremoloDepthGain);
+    tremoloDepthGain.connect(tremoloGain.gain);
+    tremoloLfo.start();
+
+    filter.connect(tremoloGain);
+    tremoloGain.connect(masterGain);
+    masterGain.connect(audioCtx.destination);
+
+    ratios.forEach((ratio, i) => {
+      const osc = audioCtx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = 110 * ratio;
+
+      const gain = audioCtx.createGain();
+      gain.gain.value = 1 / ratios.length;
+
+      osc.connect(gain);
+      gain.connect(filter);
+      osc.start();
+
+      voices.push({ osc, ratio });
+
+      // slow detune drift so the drone feels alive rather than static
+      const lfo = audioCtx.createOscillator();
+      lfo.frequency.value = 0.05 + i * 0.02;
+      const lfoGain = audioCtx.createGain();
+      lfoGain.gain.value = 3;
+      lfo.connect(lfoGain);
+      lfoGain.connect(osc.detune);
+      lfo.start();
+    });
+
+    masterGain.gain.setTargetAtTime(0.15, audioCtx.currentTime, 1.5);
+  }
+
+  function updateTempo(sliderValue) {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const t = sliderValue / 100; // 1 = top (untouched), 0 = bottom (low RPM)
+
+    // depth: exactly 0 at top (no gate at all), full on/off at bottom
+    const depth = 1 - t;
+    // rate: low RPM = slow, clearly separated pauses (~1Hz); high RPM = fast (~8Hz)
+    const rate = 1 + t * 7;
+
+    tremoloLfo.frequency.setTargetAtTime(rate, now, 0.15);
+    tremoloDepthGain.gain.setTargetAtTime(depth / 2, now, 0.15);
+    tremoloGain.gain.setTargetAtTime(1 - depth / 2, now, 0.15);
+  }
+
+  function updateSound(x, y) {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+
+    // X axis -> root pitch, one octave up/down from 110Hz
+    const rootFreq = 110 * Math.pow(2, x);
+    voices.forEach(v => v.osc.frequency.setTargetAtTime(rootFreq * v.ratio, now, 0.1));
+
+    // Y axis -> filter brightness, ~150Hz to ~6000Hz on a log curve
+    const cutoff = 150 * Math.pow(40, (y + 1) / 2);
+    filter.frequency.setTargetAtTime(cutoff, now, 0.1);
+  }
+
+  document.getElementById('startBtn').addEventListener('click', () => {
+    if (!audioCtx) {
+      initAudio();
+      updateTempo(tempoSlider.value);
+      running = true;
+      startBtn.textContent = 'Stop';
+      return;
+    }
+    if (running) {
+      masterGain.gain.setTargetAtTime(0.0001, audioCtx.currentTime, 0.5);
+      running = false;
+      startBtn.textContent = 'Start Drone';
+    } else {
+      masterGain.gain.setTargetAtTime(0.15, audioCtx.currentTime, 1.5);
+      running = true;
+      startBtn.textContent = 'Stop';
+    }
+  });
+
+  const tempoSlider = document.getElementById('tempo');
+  tempoSlider.addEventListener('input', () => updateTempo(tempoSlider.value));
+
+  // ---------- Drag ----------
+  const stage = document.getElementById('stage');
+  const handle = document.getElementById('handle');
+  const readout = document.getElementById('readout');
+  let dragging = false;
+
+  function setHandlePosition(clientX, clientY) {
+    const rect = stage.getBoundingClientRect();
+    const r = handle.offsetWidth / 2;
+
+    let px = clientX - rect.left;
+    let py = clientY - rect.top;
+
+    px = Math.max(r, Math.min(rect.width - r, px));
+    py = Math.max(r, Math.min(rect.height - r, py));
+
+    handle.style.left = px + 'px';
+    handle.style.top = py + 'px';
+
+    // normalize to -1..1, y flipped so up = +1
+    const x = (px - rect.width / 2) / (rect.width / 2 - r);
+    const y = -(py - rect.height / 2) / (rect.height / 2 - r);
+
+    readout.textContent = `x: ${x.toFixed(2)}\u00A0\u00A0\u00A0y: ${y.toFixed(2)}`;
+    updateSound(x, y);
+  }
+
+  stage.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    stage.setPointerCapture(e.pointerId);
+    setHandlePosition(e.clientX, e.clientY);
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (dragging) setHandlePosition(e.clientX, e.clientY);
+  });
+  stage.addEventListener('pointerup', () => { dragging = false; });
+  stage.addEventListener('pointercancel', () => { dragging = false; });
+</script>
+</body>
+</html>
