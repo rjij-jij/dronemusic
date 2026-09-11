@@ -1319,6 +1319,13 @@ body{
     btn.setAttribute('aria-pressed', 'false');
   }
 
+  function withTimeout(promise, ms, label){
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms))
+    ]);
+  }
+
   async function connectDock(){
     if(serialConnecting || serialActive) return;
     if(!('serial' in navigator)){
@@ -1330,21 +1337,29 @@ body{
     dockBtn.disabled = true;
     try {
       serialPort = await navigator.serial.requestPort();
-      await serialPort.open({ baudRate: 115200 });
+      // If the port is locked by another process (e.g. Arduino IDE's Serial
+      // Monitor left open), open() can hang forever on some platforms instead
+      // of throwing. This timeout stops that from freezing the tab.
+      await withTimeout(serialPort.open({ baudRate: 115200 }), 4000, 'Port open');
       serialActive = true;
       document.getElementById('serialStatus').textContent = 'SERIAL: CONNECTED';
       document.getElementById('dotSerial').classList.add('on');
       dockBtn.classList.add('on');
       dockBtn.setAttribute('aria-pressed', 'true');
-      readSerialLoop(); // runs until error/close, then fully tears itself down
+      readSerialLoop();
     } catch(err) {
       console.warn('Web Serial connection failed:', err);
       resetSerialUI();
+      // If open() timed out, the port object is in a bad state — drop it so
+      // the next click starts clean instead of hanging again.
+      try { if(serialPort && !serialActive) await serialPort.forget?.(); } catch(e){}
+      serialPort = null;
       alert(
         "Couldn't open the serial port.\n\n" +
         "Most likely cause: the Arduino IDE's Serial Monitor (or Plotter) is " +
-        "still open and has the port locked. Close it completely, then try " +
-        "CONNECT DOCK again.\n\n" +
+        "still open and has the port locked — a port can only be held by one " +
+        "program at a time. Close the IDE's monitor completely (not just the " +
+        "tab), then try CONNECT DOCK again.\n\n" +
         "Raw error: " + (err && err.message ? err.message : err)
       );
     } finally {
